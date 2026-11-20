@@ -104,30 +104,45 @@ The build runs the patch's equivalence tests, so a broken patch fails the build.
 
 ## Use it in remnanode
 
-1. Copy `out/xray` to the node, next to its `docker-compose.yml`.
-2. Add the two marked parts from [`docker-compose.yml`](docker-compose.yml):
+Ready-made binaries are on the [releases page](https://github.com/akimovvpn/xray-optimized/releases) (`xray-linux-amd64`, `xray-linux-arm64`, `SHA256SUMS`).
+Pick one of the two ways below. Don't combine them.
 
-   ```yaml
-       environment:
-         - GOMEMLIMIT=700MiB
-       volumes:
-         - ./xray:/usr/local/bin/xray:ro
-   ```
+**A. Download on start (simplest).** Add to `environment:` in the node's `docker-compose.yml`:
 
-3. Restart:
+```yaml
+      - CUSTOM_CORE_URL=https://github.com/akimovvpn/xray-optimized/releases/download/v26.11.9-opt.1/xray-linux-amd64
+      - GOMEMLIMIT=700MiB
+```
 
-   ```bash
-   docker compose up -d --force-recreate
-   ```
+remnanode's `init-env.sh` downloads the core on every container start (the docs.rw install page doesn't mention this).
+Use the pinned tag as above. A `/releases/latest/download/…` URL would also work, but then every restart could silently switch versions.
 
-4. Check that the node uses the new core. The line should end in `optimized (go1.27.x linux/amd64)`:
+**B. Mount a local file** (no download at start). Get the binary next to `docker-compose.yml`:
 
-   ```bash
-   docker compose logs remnanode | grep "Xray version"
-   ```
+```bash
+curl -fLo xray https://github.com/akimovvpn/xray-optimized/releases/download/v26.11.9-opt.1/xray-linux-amd64 && chmod +x xray
+```
 
-Alternative: set `CUSTOM_CORE_URL=https://…/xray`. remnanode's `init-env.sh` supports it, though the docs.rw node install page doesn't mention it.
-It downloads the core on every container start, so you have to host the file somewhere. Don't combine it with the volume mount.
+Then add the two marked parts from [`docker-compose.yml`](docker-compose.yml):
+
+```yaml
+    environment:
+      - GOMEMLIMIT=700MiB
+    volumes:
+      - ./xray:/usr/local/bin/xray:ro
+```
+
+Either way, restart:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+Then check that the node uses the new core. The line should end in `optimized (go1.27.4 linux/amd64)`:
+
+```bash
+docker compose logs remnanode | grep "Xray version"
+```
 
 **When remnawave/node moves to a new Xray version:** change `XRAY_VERSION` in the Dockerfile, rebuild, and run the test.
 If `git apply`, `patch` or the build's tests fail, the upstream code changed and the patches need redoing.
