@@ -1,0 +1,23 @@
+# Your normal remnanode compose + 2 additions (marked). Put the built `xray` file next to this file first,
+# otherwise docker creates an empty directory at ./xray and the node will not start.
+services:
+  remnanode:
+    image: remnawave/node:latest
+    container_name: remnanode
+    hostname: remnanode
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - NODE_PORT=2222
+      - SECRET_KEY="paste the key from the panel here"
+      # (1) Soft heap cap for xray's Go runtime: ~70% of the RAM you want xray to use. Too low = GC burns CPU.
+      - GOMEMLIMIT=700MiB
+    volumes:
+      # (2) Replace the bundled core. remnanode runs /usr/local/bin/xray (via the rw-core symlink).
+      - ./xray:/usr/local/bin/xray:ro
