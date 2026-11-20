@@ -16,6 +16,9 @@ WORKDIR /src
 RUN git clone --depth 1 --branch "${XRAY_VERSION}" https://github.com/XTLS/Xray-core.git .
 
 COPY patches/ /patches/
+# CPU/RAM patch (see README "Performance"). Its tests compare the new code with the upstream implementation.
+RUN git apply /patches/xray-core-performance.patch \
+    && go test -count=1 -run 'IsCompleteRecord|XtlsPadding|ReadSingle|ReadVReader' ./proxy/ ./common/buf/
 RUN go mod download github.com/xtls/reality \
     && cp -r "$(go list -m -f '{{.Dir}}' github.com/xtls/reality)" /reality \
     && chmod -R u+w /reality \

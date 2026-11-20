@@ -1,10 +1,11 @@
 # Optimized Xray-core for remnanode
 
-Upstream Xray-core **v26.11.9** (the version `remnawave/node` 3.4.6 ships) with **one patch** and a tuned build.
+Upstream Xray-core **v26.11.9** (the version `remnawave/node` 3.4.6 ships) with **two patches** and a tuned build.
+Neither patch changes a byte on the wire.
 
 ## What's changed and why
 
-**The patch fixes mihomo clients.** Since Xray v26.9.9 ([XTLS/REALITY@8cdf7bf](https://github.com/XTLS/REALITY/commit/8cdf7bf9c7f0)), the REALITY server
+**Patch 1 fixes mihomo clients.** Since Xray v26.9.9 ([XTLS/REALITY@8cdf7bf](https://github.com/XTLS/REALITY/commit/8cdf7bf9c7f0)), the REALITY server
 treats any Client Hello without an `X25519MLKEM768` key share as a prober and forwards it to the target site.
 mihomo strips that key share unless `support-x25519mlkem768: true` is set, so default mihomo configs fail with
 `REALITY authentication failed`. [`patches/reality-accept-x25519-only.patch`](patches/reality-accept-x25519-only.patch) restores the pre-v26.9.9
@@ -19,6 +20,8 @@ Tested with mihomo v1.19.34 using `test/mihomo-compat.sh`:
 | VLESS + REALITY + XHTTP, default | FAIL (auth failed) | PASS |
 | Plain TLS probe without key | n/a | forwarded to real site (PASS) |
 
+**Patch 2 cuts CPU and memory** ([`patches/xray-core-performance.patch`](patches/xray-core-performance.patch)). Details in "Performance" below.
+
 **The build** uses upstream's release flags (`-trimpath -s -w -gcflags=all=-l=4`) and Go 1.27. You can also turn on:
 - **PGO**: put `default.pgo` next to the Dockerfile. Go typically reports 2–14% less CPU. See "CPU" below.
 - **`GOAMD64=v3`** (AVX2): only if `grep -c avx2 /proc/cpuinfo` prints more than 0 on the node. Otherwise the binary won't start.
@@ -27,6 +30,68 @@ Tested with mihomo v1.19.34 using `test/mihomo-compat.sh`:
 - The wire protocol. Changing it would break mihomo, sing-box and v2rayN clients.
 - The feature set. Panel config profiles can use any feature, and remnanode needs the API, stats and routing services.
 
+## Performance
+
+Measured with `bench/run.sh`: a remnanode-like server with 1000 users, per-user stats, the API, online-IP tracking,
+sniffing and geoip/geosite rules, pinned to 2 CPUs. The client and traffic generator run on other CPUs.
+The traffic is inner TLS, like real HTTPS. The machine is an arm64 Docker VM, so look at the relative numbers.
+Stock is the same source and build flags without patch 2.
+
+| scenario | stock | this build |
+|---|---|---|
+| Vision download: CPU per GB (3 runs each) | 2.6–3.5 s | **1.5–1.8 s**, 0.6 s when direct mode starts early |
+| Vision download: throughput on 2 CPUs | 530–705 MB/s | **950–1,130 MB/s** |
+| Vision download: heap allocated per 12 GB / GC runs | 9.8–13 GB / 1,350–1,790 | **0.02–0.4 GB / 2–74** |
+| 6000 short connections: CPU per connection | 1.10 ms | **0.98–1.01 ms** |
+| 6000 short connections: heap allocated | 1,120 MB | **720 MB** |
+| 3000 idle connections: RSS | 247–254 MB | **214 MB** |
+| XHTTP download (code path not touched) | 2.48 s/GB | 2.37 s/GB (noise) |
+
+What the profiles showed and what the patch does:
+
+1. **Vision padding mode was the #1 CPU and allocation sink.** Vision only switches to its fast direct copy when a read
+   ends exactly on an inner-TLS record boundary (that's needed for stealth). On fast downloads that can take a long time,
+   and every write until then went through three slow helpers:
+   - `IsCompleteRecord` copied the whole buffer into a new slice: 92% of all heap allocations on a download. It now walks the buffers in place (0 allocations, 5 ns instead of 6–10 µs).
+   - `ReshapeMultiBuffer` searched for record headers with Rabin-Karp (`bytes.LastIndex`): 29% of server CPU. It now scans 8 bytes at a time (7× faster), and it builds its debug-log string only when debug logging is on.
+   - `XtlsPadding` used `crypto/rand.Int`, which allocates a `big.Int` and makes a getrandom call per padding. It now uses Go's ChaCha8 global source (OS-seeded, unpredictable, allocation-free) with the same uniform range. Debug-log arguments are no longer boxed when debug is off.
+
+   The whole padding write path is **5.9× faster** (33.5 µs → 5.7 µs per 32 KB) and allocates 96% less.
+   The results are identical to upstream: fuzz tests compare the new code with the upstream implementations,
+   and upstream's VLESS / Vision / REALITY end-to-end scenario tests pass.
+2. **Idle connections pinned an 8 KB buffer each.** The reader on the raw client socket took a buffer from the pool
+   and then blocked. On a bare TCP/Unix socket it now waits for readability first and takes the buffer only when data
+   is there. Errors, EOF and deadlines behave as before (tested). Other platforms and wrapped connections keep the old code.
+
+Measured but **not** changed, because the cost is inherent or the fix isn't worth the risk:
+- In padding mode the remaining CPU is write syscalls (one per TLS record) and AES-GCM. Batching them would change record sizes and packet timing on the wire.
+- Each connection runs 3 goroutines (~10 KB of stack each on average). That's xray's architecture.
+- REALITY allocates two 17 KB buffers per handshake, and VLESS allocates an unpooled 8 KB first-packet buffer (about 35% of short-connection allocations). Pooling them is only safe if nothing reads them after release, and I haven't proven that.
+- `GOGC`: 200 saves 4% CPU under churn for +33% peak memory, and 400 saves 6% for 2× memory. The default is the right balance. Use `GOMEMLIMIT` as the cap.
+- The access log (on by default, one line per connection) costs about 1% CPU. Turn it off with `"log": {"access": "none"}` if you don't need it.
+
+Re-run it yourself:
+
+```bash
+bench/run.sh out/xray-opt opt
+```
+
+One-time setup on an Apple Silicon Mac (use `--platform linux/amd64` on x86). It takes the stock core and geo files from remnanode and builds the load generator:
+
+```bash
+mkdir -p out/geo && docker create --platform linux/arm64 --name rwx remnawave/node:3.4.6 && docker cp -L rwx:/usr/local/bin/xray out/xray-stock && docker cp rwx:/usr/local/share/xray/geoip.dat out/geo/ && docker cp rwx:/usr/local/share/xray/geosite.dat out/geo/ && docker rm rwx
+```
+
+```bash
+docker run --rm -v "$PWD:/w" -w /w/bench/loadgen -e CGO_ENABLED=0 golang:1.27-alpine go build -o /w/out/loadgen .
+```
+
+```bash
+docker buildx build --platform linux/arm64 -o out/opt . && mv out/opt/xray out/xray-opt
+```
+
+Results (summary, CPU/heap/alloc profiles, goroutine dump) go to `bench/results/<label>/`.
+
 ## Build
 
 ```bash
@@ -34,7 +99,8 @@ docker buildx build --platform linux/amd64 -o out .
 ```
 
 Output is `out/xray`. For an ARM node use `--platform linux/arm64`. For AVX2 add `--build-arg GOAMD64=v3`.
-`out/xray` in this folder is already built for amd64, without PGO, with `GOAMD64=v1`.
+`out/xray` in this folder is already built for amd64 (both patches, no PGO, `GOAMD64=v1`).
+The build runs the patch's equivalence tests, so a broken patch fails the build.
 
 ## Use it in remnanode
 
@@ -64,7 +130,7 @@ Alternative: set `CUSTOM_CORE_URL=https://…/xray`. remnanode's `init-env.sh` s
 It downloads the core on every container start, so you have to host the file somewhere. Don't combine it with the volume mount.
 
 **When remnawave/node moves to a new Xray version:** change `XRAY_VERSION` in the Dockerfile, rebuild, and run the test.
-If `patch` fails, the upstream code changed and the patch needs redoing.
+If `git apply`, `patch` or the build's tests fail, the upstream code changed and the patches need redoing.
 
 ## Memory (set in the panel config profile)
 

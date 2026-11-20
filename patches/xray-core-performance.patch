@@ -1,0 +1,706 @@
+diff --git a/common/buf/readv_reader.go b/common/buf/readv_reader.go
+index 6ce4462..15a5f56 100644
+--- a/common/buf/readv_reader.go
++++ b/common/buf/readv_reader.go
+@@ -123,7 +123,7 @@ func (r *ReadVReader) readMulti() (MultiBuffer, error) {
+ // ReadMultiBuffer implements Reader.
+ func (r *ReadVReader) ReadMultiBuffer() (MultiBuffer, error) {
+ 	if r.alloc.Current() == 1 {
+-		b, err := ReadBuffer(r.Reader)
++		b, err := r.readSingle()
+ 		if b.IsFull() {
+ 			r.alloc.Adjust(1)
+ 		}
+diff --git a/common/buf/readv_single_other.go b/common/buf/readv_single_other.go
+new file mode 100644
+index 0000000..7171f33
+--- /dev/null
++++ b/common/buf/readv_single_other.go
+@@ -0,0 +1,7 @@
++//go:build !unix && !wasm
++
++package buf
++
++func (r *ReadVReader) readSingle() (*Buffer, error) {
++	return ReadBuffer(r.Reader)
++}
+diff --git a/common/buf/readv_single_test.go b/common/buf/readv_single_test.go
+new file mode 100644
+index 0000000..379fb73
+--- /dev/null
++++ b/common/buf/readv_single_test.go
+@@ -0,0 +1,111 @@
++//go:build unix && !openbsd
++
++package buf
++
++import (
++	"errors"
++	"io"
++	"net"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// tcpPair returns the client end and a ReadVReader on the accepted server end.
++func tcpPair(t *testing.T) (*net.TCPConn, *ReadVReader, *net.TCPConn) {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	client, err := net.Dial("tcp", ln.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	server, err := ln.Accept()
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { client.Close(); server.Close() })
++	raw, err := server.(*net.TCPConn).SyscallConn()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return client.(*net.TCPConn), NewReadVReader(server, raw, nil), server.(*net.TCPConn)
++}
++
++func TestReadSingle(t *testing.T) {
++	tests := []struct {
++		name  string
++		act   func(client, server *net.TCPConn)
++		check func(t *testing.T, b *Buffer, err error)
++	}{
++		{"data arrives later", func(c, _ *net.TCPConn) {
++			go func() { time.Sleep(50 * time.Millisecond); c.Write([]byte("hello")) }()
++		}, func(t *testing.T, b *Buffer, err error) {
++			if err != nil || b.String() != "hello" {
++				t.Fatalf("got %q, %v", b.String(), err)
++			}
++		}},
++		{"peer closes", func(c, _ *net.TCPConn) { c.Close() }, func(t *testing.T, b *Buffer, err error) {
++			if b != nil || err != io.EOF {
++				t.Fatalf("got %v, %v; want nil, EOF", b, err)
++			}
++		}},
++		{"read deadline", func(_, s *net.TCPConn) { s.SetReadDeadline(time.Now().Add(50 * time.Millisecond)) },
++			func(t *testing.T, b *Buffer, err error) {
++				var ne net.Error
++				if b != nil || !errors.As(err, &ne) || !ne.Timeout() {
++					t.Fatalf("got %v, %v; want a timeout", b, err)
++				}
++			}},
++		{"peer resets", func(c, _ *net.TCPConn) { c.SetLinger(0); c.Close() }, func(t *testing.T, b *Buffer, err error) {
++			if b != nil || !errors.Is(err, syscall.ECONNRESET) {
++				t.Fatalf("got %v, %v; want ECONNRESET", b, err)
++			}
++		}},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			client, r, server := tcpPair(t)
++			tt.act(client, server)
++			if tt.name == "peer resets" {
++				time.Sleep(50 * time.Millisecond) // let the RST land before reading
++			}
++			b, err := r.readSingle()
++			tt.check(t, b, err)
++			if b != nil {
++				b.Release()
++			}
++		})
++	}
++}
++
++func TestReadVReaderLargeTransfer(t *testing.T) {
++	client, r, _ := tcpPair(t)
++	want := make([]byte, 4<<20)
++	for i := range want {
++		want[i] = byte(i * 7)
++	}
++	go func() { client.Write(want); client.Close() }()
++	var got []byte
++	for {
++		mb, err := r.ReadMultiBuffer()
++		for _, b := range mb {
++			if b != nil { // like upstream, EOF from the single-buffer path comes as MultiBuffer{nil}
++				got = append(got, b.Bytes()...)
++			}
++		}
++		ReleaseMulti(mb)
++		if err == io.EOF {
++			break
++		}
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	if string(got) != string(want) {
++		t.Fatalf("got %d bytes, want %d (or content differs)", len(got), len(want))
++	}
++}
+diff --git a/common/buf/readv_single_unix.go b/common/buf/readv_single_unix.go
+new file mode 100644
+index 0000000..2dd42af
+--- /dev/null
++++ b/common/buf/readv_single_unix.go
+@@ -0,0 +1,58 @@
++//go:build unix && !openbsd
++
++package buf
++
++import (
++	"io"
++	"net"
++	"os"
++	"syscall"
++)
++
++// readSingle is ReadBuffer(r.Reader). For a bare TCP/Unix socket it takes the buffer from the pool only once the
++// socket is readable, so an idle connection no longer pins 8 KiB while it waits ([optimized-xray]).
++func (r *ReadVReader) readSingle() (*Buffer, error) {
++	conn, ok := r.Reader.(net.Conn)
++	switch r.Reader.(type) {
++	case *net.TCPConn, *net.UnixConn:
++	default:
++		ok = false
++	}
++	if !ok {
++		return ReadBuffer(r.Reader)
++	}
++	var b *Buffer
++	var n int
++	var errno error
++	err := r.rawConn.Read(func(fd uintptr) bool {
++		if b == nil {
++			b = New()
++		}
++		for {
++			n, errno = syscall.Read(int(fd), b.v)
++			if errno != syscall.EINTR {
++				break
++			}
++		}
++		if errno == syscall.EAGAIN {
++			b.Release() // nothing to read yet: give the buffer back while the poller waits
++			b = nil
++			return false
++		}
++		return true
++	})
++	if err == nil && errno != nil {
++		err = &net.OpError{Op: "read", Net: conn.LocalAddr().Network(), Source: conn.LocalAddr(), Addr: conn.RemoteAddr(), Err: os.NewSyscallError("read", errno)}
++	}
++	if err == nil && n == 0 {
++		err = io.EOF
++	}
++	if n > 0 {
++		b.end = int32(n)
++		return b, nil
++	}
++	if b != nil {
++		b.Release()
++	}
++	return nil, err
++}
+diff --git a/proxy/proxy.go b/proxy/proxy.go
+index 6008437..7533e17 100644
+--- a/proxy/proxy.go
++++ b/proxy/proxy.go
+@@ -8,9 +8,10 @@ package proxy
+ import (
+ 	"bytes"
+ 	"context"
+-	"crypto/rand"
++	"encoding/binary"
+ 	"io"
+-	"math/big"
++	"math/bits"
++	"math/rand/v2"
+ 	"runtime"
+ 	"strconv"
+ 	"time"
+@@ -19,6 +20,7 @@ import (
+ 	"github.com/xtls/xray-core/app/dispatcher"
+ 	"github.com/xtls/xray-core/common/buf"
+ 	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/log"
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/protocol"
+ 	"github.com/xtls/xray-core/common/session"
+@@ -409,57 +411,76 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+ }
+ 
+ // IsCompleteRecord Is complete tls data record
++// [optimized-xray] Walks the buffers in place; the upstream version copied the whole MultiBuffer into a new slice on every call.
+ func IsCompleteRecord(buffer buf.MultiBuffer) bool {
+-	b := make([]byte, buffer.Len())
+-	if buffer.Copy(b) != int(buffer.Len()) {
+-		panic("impossible bytes allocation")
+-	}
+-	var headerLen int = 5
+-	var recordLen int
+-
+-	totalLen := len(b)
+-	i := 0
+-	for i < totalLen {
+-		// record header: 0x17 0x3 0x3 + 2 bytes length
+-		if headerLen > 0 {
+-			data := b[i]
+-			i++
+-			switch headerLen {
+-			case 5:
+-				if data != 0x17 {
+-					return false
++	headerLen := 5
++	recordLen := 0
++	remaining := int(buffer.Len())
++	for _, b := range buffer {
++		if b == nil {
++			continue
++		}
++		data := b.Bytes()
++		for i := 0; i < len(data); {
++			// record header: 0x17 0x3 0x3 + 2 bytes length
++			if headerLen > 0 {
++				c := data[i]
++				i++
++				remaining--
++				switch headerLen {
++				case 5:
++					if c != 0x17 {
++						return false
++					}
++				case 4, 3:
++					if c != 0x03 {
++						return false
++					}
++				case 2:
++					recordLen = int(c) << 8
++				case 1:
++					recordLen |= int(c)
+ 				}
+-			case 4:
+-				if data != 0x03 {
++				headerLen--
++			} else if recordLen > 0 {
++				if remaining < recordLen {
+ 					return false
+ 				}
+-			case 3:
+-				if data != 0x03 {
+-					return false
++				n := min(recordLen, len(data)-i) // a record body can span buffers
++				i += n
++				remaining -= n
++				recordLen -= n
++				if recordLen == 0 {
++					headerLen = 5
+ 				}
+-			case 2:
+-				recordLen = int(data) << 8
+-			case 1:
+-				recordLen = recordLen | int(data)
+-			}
+-			headerLen--
+-		} else if recordLen > 0 {
+-			remaining := totalLen - i
+-			if remaining < recordLen {
+-				return false
+ 			} else {
+-				i += recordLen
+-				recordLen = 0
+-				headerLen = 5
++				return false
+ 			}
+-		} else {
+-			return false
+ 		}
+ 	}
+-	if headerLen == 5 && recordLen == 0 {
+-		return true
++	return headerLen == 5 && recordLen == 0
++}
++
++// lastIndexTlsApplicationData is bytes.LastIndex(b, TlsApplicationDataStart) without Rabin-Karp ([optimized-xray]):
++// it scans backwards 8 bytes at a time with exact zero-byte masks, ~7x faster on 8 KiB buffers.
++func lastIndexTlsApplicationData(b []byte) int {
++	const lo7 = 0x7f7f7f7f7f7f7f7f
++	zero := func(x uint64) uint64 { return ^(((x & lo7) + lo7) | x | lo7) } // 0x80 in every byte of x that is 0
++	i := len(b) - 10                                                        // each step reads b[i : i+10] and tests starts i..i+7
++	for ; i >= 0; i -= 8 {
++		m := zero(binary.LittleEndian.Uint64(b[i:])^0x1717171717171717) &
++			zero(binary.LittleEndian.Uint64(b[i+1:])^0x0303030303030303) &
++			zero(binary.LittleEndian.Uint64(b[i+2:])^0x0303030303030303)
++		if m != 0 {
++			return i + (63-bits.LeadingZeros64(m))/8 // highest matching byte = last occurrence
++		}
++	}
++	for j := min(i+7, len(b)-3); j >= 0; j-- {
++		if b[j] == 0x17 && b[j+1] == 0x03 && b[j+2] == 0x03 {
++			return j
++		}
+ 	}
+-	return false
++	return -1
+ }
+ 
+ // ReshapeMultiBuffer prepare multi buffer for padding structure (max 21 bytes)
+@@ -474,10 +495,11 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
+ 		return buffer
+ 	}
+ 	mb2 := make(buf.MultiBuffer, 0, len(buffer)+needReshape)
++	debug := log.GetSeverity() >= log.Severity_Debug
+ 	toPrint := ""
+ 	for i, buffer1 := range buffer {
+ 		if buffer1.Len() >= buf.Size-21 {
+-			index := int32(bytes.LastIndex(buffer1.Bytes(), TlsApplicationDataStart))
++			index := int32(lastIndexTlsApplicationData(buffer1.Bytes()))
+ 			if index < 21 || index > buf.Size-21 {
+ 				index = buf.Size / 2
+ 			}
+@@ -485,15 +507,21 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
+ 			buffer2.Write(buffer1.BytesFrom(index))
+ 			buffer1.Resize(0, index)
+ 			mb2 = append(mb2, buffer1, buffer2)
+-			toPrint += " " + strconv.Itoa(int(buffer1.Len())) + " " + strconv.Itoa(int(buffer2.Len()))
++			if debug {
++				toPrint += " " + strconv.Itoa(int(buffer1.Len())) + " " + strconv.Itoa(int(buffer2.Len()))
++			}
+ 		} else {
+ 			mb2 = append(mb2, buffer1)
+-			toPrint += " " + strconv.Itoa(int(buffer1.Len()))
++			if debug {
++				toPrint += " " + strconv.Itoa(int(buffer1.Len()))
++			}
+ 		}
+ 		buffer[i] = nil
+ 	}
+ 	buffer = buffer[:0]
+-	errors.LogDebug(ctx, "ReshapeMultiBuffer ", toPrint)
++	if debug {
++		errors.LogDebug(ctx, "ReshapeMultiBuffer ", toPrint)
++	}
+ 	return mb2
+ }
+ 
+@@ -504,18 +532,12 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
+ 	if b != nil {
+ 		contentLen = b.Len()
+ 	}
++	// [optimized-xray] math/rand/v2's global source is ChaCha8 seeded from the OS (unpredictable), and unlike
++	// crypto/rand.Int it allocates nothing and makes no getrandom call. Same uniform [0, n) range.
+ 	if contentLen < int32(testseed[0]) && longPadding {
+-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[1])))
+-		if err != nil {
+-			errors.LogDebugInner(ctx, err, "failed to generate padding")
+-		}
+-		paddingLen = int32(l.Int64()) + int32(testseed[2]) - contentLen
++		paddingLen = int32(rand.Int64N(int64(testseed[1]))) + int32(testseed[2]) - contentLen
+ 	} else {
+-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[3])))
+-		if err != nil {
+-			errors.LogDebugInner(ctx, err, "failed to generate padding")
+-		}
+-		paddingLen = int32(l.Int64())
++		paddingLen = int32(rand.Int64N(int64(testseed[3])))
+ 	}
+ 	if paddingLen > buf.Size-21-contentLen {
+ 		paddingLen = buf.Size - 21 - contentLen
+@@ -532,7 +554,9 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
+ 		b = nil
+ 	}
+ 	newbuffer.Extend(paddingLen)
+-	errors.LogDebug(ctx, "XtlsPadding ", contentLen, " ", paddingLen, " ", command)
++	if log.GetSeverity() >= log.Severity_Debug { // boxing the args allocates even when debug is off
++		errors.LogDebug(ctx, "XtlsPadding ", contentLen, " ", paddingLen, " ", command)
++	}
+ 	return newbuffer
+ }
+ 
+@@ -579,7 +603,9 @@ func XtlsUnpadding(b *buf.Buffer, s *TrafficState, isUplink bool, ctx context.Co
+ 				*remainingPadding = int32(data) << 8
+ 			case 1:
+ 				*remainingPadding = *remainingPadding | int32(data)
+-				errors.LogDebug(ctx, "Xtls Unpadding new block, content ", *remainingContent, " padding ", *remainingPadding, " command ", *currentCommand)
++				if log.GetSeverity() >= log.Severity_Debug {
++					errors.LogDebug(ctx, "Xtls Unpadding new block, content ", *remainingContent, " padding ", *remainingPadding, " command ", *currentCommand)
++				}
+ 			}
+ 			*remainingCommand--
+ 		} else if *remainingContent > 0 {
+diff --git a/proxy/vision_bench_test.go b/proxy/vision_bench_test.go
+new file mode 100644
+index 0000000..9ed052d
+--- /dev/null
++++ b/proxy/vision_bench_test.go
+@@ -0,0 +1,62 @@
++package proxy
++
++import (
++	"context"
++	"crypto/rand"
++	"testing"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/log"
++)
++
++// warningOnly mimics a production node: log level "warning", so debug logging is off.
++type warningOnly struct{}
++
++func (warningOnly) Handle(log.Message)     {}
++func (warningOnly) Severity() log.Severity { return log.Severity_Warning }
++
++// Uses only exported functions so the same benchmark runs on upstream code for comparison.
++
++// paddingStream mimics a fast inner-TLS download: 16 KiB records read in full 8 KiB chunks,
++// so buffers rarely end on a record boundary and Vision stays in padding mode.
++func paddingStream(n int) buf.MultiBuffer {
++	var data []byte
++	for len(data) < n*buf.Size+100 {
++		r := []byte{0x17, 0x03, 0x03, 0x40, 0x00}
++		body := make([]byte, 16384)
++		_, _ = rand.Read(body)
++		data = append(append(data, r...), body...)
++	}
++	data = data[100 : 100+n*buf.Size]
++	var mb buf.MultiBuffer
++	for len(data) > 0 {
++		b := buf.New()
++		b.Write(data[:buf.Size])
++		mb = append(mb, b)
++		data = data[buf.Size:]
++	}
++	return mb
++}
++
++// BenchmarkVisionPaddingWrite is the per-write work VisionWriter does while padding.
++func BenchmarkVisionPaddingWrite(b *testing.B) {
++	seed := []uint32{900, 500, 900, 256}
++	ctx := context.Background()
++	src := paddingStream(4)
++	log.RegisterHandler(warningOnly{})
++	b.ReportAllocs()
++	b.SetBytes(int64(src.Len()))
++	for b.Loop() {
++		mb := make(buf.MultiBuffer, len(src))
++		for i, s := range src {
++			mb[i] = buf.New()
++			mb[i].Write(s.Bytes())
++		}
++		_ = IsCompleteRecord(mb)
++		mb = ReshapeMultiBuffer(ctx, mb)
++		for i, x := range mb {
++			mb[i] = XtlsPadding(x, CommandPaddingContinue, nil, false, ctx, seed)
++		}
++		buf.ReleaseMulti(mb)
++	}
++}
+diff --git a/proxy/vision_opt_test.go b/proxy/vision_opt_test.go
+new file mode 100644
+index 0000000..8905bdd
+--- /dev/null
++++ b/proxy/vision_opt_test.go
+@@ -0,0 +1,199 @@
++package proxy
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"testing"
++
++	"github.com/xtls/xray-core/common/buf"
++)
++
++// isCompleteRecordUpstream is the v26.11.9 implementation, kept as the reference.
++func isCompleteRecordUpstream(buffer buf.MultiBuffer) bool {
++	b := make([]byte, buffer.Len())
++	if buffer.Copy(b) != int(buffer.Len()) {
++		panic("impossible bytes allocation")
++	}
++	headerLen, recordLen, totalLen, i := 5, 0, len(b), 0
++	for i < totalLen {
++		if headerLen > 0 {
++			data := b[i]
++			i++
++			switch headerLen {
++			case 5:
++				if data != 0x17 {
++					return false
++				}
++			case 4, 3:
++				if data != 0x03 {
++					return false
++				}
++			case 2:
++				recordLen = int(data) << 8
++			case 1:
++				recordLen = recordLen | int(data)
++			}
++			headerLen--
++		} else if recordLen > 0 {
++			if totalLen-i < recordLen {
++				return false
++			}
++			i += recordLen
++			recordLen = 0
++			headerLen = 5
++		} else {
++			return false
++		}
++	}
++	return headerLen == 5 && recordLen == 0
++}
++
++func record(n int) []byte {
++	r := []byte{0x17, 0x03, 0x03, byte(n >> 8), byte(n)}
++	return append(r, bytes.Repeat([]byte{0xAA}, n)...)
++}
++
++// split cuts data into buffers at the given offsets (taken modulo the remaining length).
++func split(data []byte, cuts []byte) buf.MultiBuffer {
++	var mb buf.MultiBuffer
++	for _, c := range cuts {
++		if len(data) == 0 {
++			break
++		}
++		n := min(int(c)%(len(data)+1), buf.Size)
++		b := buf.New()
++		b.Write(data[:n])
++		mb = append(mb, b)
++		data = data[n:]
++	}
++	for len(data) > 0 {
++		n := min(len(data), buf.Size)
++		b := buf.New()
++		b.Write(data[:n])
++		mb = append(mb, b)
++		data = data[n:]
++	}
++	return mb
++}
++
++func TestIsCompleteRecord(t *testing.T) {
++	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
++	tests := []struct {
++		name string
++		data []byte
++		cuts []byte
++		want bool
++	}{
++		{"empty", nil, nil, true},
++		{"one record", record(100), nil, true},
++		{"two records", cat(record(100), record(3000)), nil, true},
++		{"record split across buffers", cat(record(100), record(3000)), []byte{3, 50, 200}, true},
++		{"header split across buffers", cat(record(10), record(10)), []byte{17, 1, 1}, true},
++		{"truncated body", record(100)[:80], nil, false},
++		{"truncated header", cat(record(10), record(10)[:3]), nil, false},
++		{"zero-length record", []byte{0x17, 0x03, 0x03, 0, 0}, nil, false},
++		{"not application data", []byte{0x16, 0x03, 0x03, 0, 1, 0}, nil, false},
++		{"bad version", []byte{0x17, 0x03, 0x01, 0, 1, 0}, nil, false},
++		{"trailing garbage", cat(record(10), []byte{0x17}), nil, false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			mb := split(tt.data, tt.cuts)
++			defer buf.ReleaseMulti(mb)
++			if got := IsCompleteRecord(mb); got != tt.want {
++				t.Errorf("IsCompleteRecord() = %v, want %v", got, tt.want)
++			}
++			if ref := isCompleteRecordUpstream(mb); ref != tt.want {
++				t.Fatalf("reference disagrees with the test table: %v", ref)
++			}
++		})
++	}
++}
++
++func FuzzIsCompleteRecord(f *testing.F) {
++	f.Add(record(100), []byte{7, 200})
++	f.Add(append(record(5), record(9000)...), []byte{1, 2, 3, 255})
++	f.Fuzz(func(t *testing.T, data []byte, cuts []byte) {
++		mb := split(data, cuts)
++		defer buf.ReleaseMulti(mb)
++		if got, want := IsCompleteRecord(mb), isCompleteRecordUpstream(mb); got != want {
++			t.Fatalf("IsCompleteRecord() = %v, upstream = %v", got, want)
++		}
++	})
++}
++
++func FuzzLastIndexTlsApplicationData(f *testing.F) {
++	f.Add([]byte{0x17, 0x03, 0x03, 0x17, 0x03, 0x03})
++	f.Add([]byte{0x17, 0x17, 0x03, 0x03, 0x03})
++	f.Fuzz(func(t *testing.T, data []byte) {
++		if got, want := lastIndexTlsApplicationData(data), bytes.LastIndex(data, TlsApplicationDataStart); got != want {
++			t.Fatalf("lastIndexTlsApplicationData() = %d, bytes.LastIndex = %d", got, want)
++		}
++	})
++}
++
++func TestXtlsPaddingRange(t *testing.T) {
++	seed := []uint32{900, 500, 900, 256}
++	for range 2000 {
++		for _, content := range []int32{0, 100, 1000, 8000} {
++			b := buf.New()
++			b.Extend(content)
++			out := XtlsPadding(b, CommandPaddingContinue, nil, true, context.Background(), seed)
++			h := out.BytesTo(5)
++			gotContent := int32(h[1])<<8 | int32(h[2])
++			pad := int32(h[3])<<8 | int32(h[4])
++			maxPad := int32(buf.Size - 21 - content)
++			if gotContent != content || pad < 0 || pad > maxPad || out.Len() != 5+content+pad {
++				t.Fatalf("content=%d header=%v len=%d", content, h, out.Len())
++			}
++			if content < 900 && pad < min(900-content, maxPad) { // long padding is at least seed[2]-content
++				t.Fatalf("long padding too short: content=%d pad=%d", content, pad)
++			}
++			out.Release()
++		}
++	}
++}
++
++// streamBuffers mimics a fast inner-TLS download: 16 KiB records read in full 8 KiB chunks,
++// so buffers rarely end on a record boundary and Vision stays in padding mode.
++func streamBuffers(n int) buf.MultiBuffer {
++	var data []byte
++	for len(data) < n*buf.Size+100 {
++		r := record(16384)
++		_, _ = rand.Read(r[5:])
++		data = append(data, r...)
++	}
++	return split(data[100:100+n*buf.Size], nil)
++}
++
++func BenchmarkIsCompleteRecord(b *testing.B) {
++	mb := streamBuffers(4)
++	b.Run("upstream", func(b *testing.B) {
++		b.ReportAllocs()
++		for b.Loop() {
++			isCompleteRecordUpstream(mb)
++		}
++	})
++	b.Run("optimized", func(b *testing.B) {
++		b.ReportAllocs()
++		for b.Loop() {
++			IsCompleteRecord(mb)
++		}
++	})
++}
++
++func BenchmarkLastIndexTlsApplicationData(b *testing.B) {
++	data := make([]byte, buf.Size)
++	_, _ = rand.Read(data)
++	b.Run("upstream", func(b *testing.B) {
++		for b.Loop() {
++			bytes.LastIndex(data, TlsApplicationDataStart)
++		}
++	})
++	b.Run("optimized", func(b *testing.B) {
++		for b.Loop() {
++			lastIndexTlsApplicationData(data)
++		}
++	})
++}
